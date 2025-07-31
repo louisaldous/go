@@ -3,18 +3,22 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"io"
 	"log"
 	"net"
+	"os"
+	"sync"
 	"sync/atomic"
+	"time"
 )
 
 var nextConnectionId atomic.Uint64
 
 type client struct {
-	clientID           uint64
-	clientInputChannel chan []byte
-	tcpConnection      net.Conn
+	id        uint64
+	inputChan chan []byte
+	conn      net.Conn
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -25,21 +29,33 @@ type message struct {
 	sender uint64 // client id
 }
 
-func (c *client) start(broadcastChan chan<- message, unregisterClientChan chan<- uint64) {
+func (c *client) start(broadcastChan chan<- message, unregisterChan chan<- uint64) {
+	var wg sync.WaitGroup
+
 	defer func() {
-		unregisterClientChan <- c.clientID
-		close(c.clientInputChannel)
-		c.tcpConnection.Close()
+		wg.Wait()
+		unregisterChan <- c.id
+		close(c.inputChan)
+		c.conn.Close()
 	}()
 
-	go c.listen(broadcastChan)
-	go c.send()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		c.listen(broadcastChan)
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		c.send()
+	}()
 
 	<-c.ctx.Done()
 }
 
 func (c *client) listen(broadcastChan chan<- message) {
-	reader := bufio.NewReader(c.tcpConnection)
+	reader := bufio.NewReader(c.conn)
 	for {
 		select {
 		case <-c.ctx.Done():
@@ -47,19 +63,23 @@ func (c *client) listen(broadcastChan chan<- message) {
 		default:
 		}
 
+		c.conn.SetReadDeadline(time.Now().Add(1000 * time.Millisecond))
 		msg, err := reader.ReadBytes('\n')
 		if err != nil {
-			if err == io.EOF {
-				log.Printf("INFO: Connection to %d closed (EOF).\n", c.clientID)
-			} else {
-				log.Printf("WARNING: Error reading from client %d: %v\n", c.clientID, err)
+			if !errors.Is(err, os.ErrDeadlineExceeded) {
+				if err == io.EOF {
+					log.Printf("INFO: Connection to %d closed (EOF).\n", c.id)
+				} else {
+					log.Printf("WARNING: Error reading from client %d: %v\n", c.id, err)
+				}
+
+				c.cancel()
+				return
 			}
-			c.cancel()
-			return
 		}
 
 		if len(msg) > 0 {
-			broadcastChan <- message{data: msg, sender: c.clientID}
+			broadcastChan <- message{data: msg, sender: c.id}
 		}
 	}
 }
@@ -70,12 +90,12 @@ func (c *client) send() {
 		case <-c.ctx.Done():
 			return
 
-		case msg, ok := <-c.clientInputChannel:
+		case msg, ok := <-c.inputChan:
 			if !ok {
 				return
 			}
 
-			_, err := c.tcpConnection.Write(msg)
+			_, err := c.conn.Write(msg)
 			if err != nil {
 				log.Printf("WARNING: error writing to client: %v\n", err)
 				c.cancel()
@@ -93,10 +113,10 @@ func main() {
 	}
 
 	broadcastChan := make(chan message)
-	registerClientChan := make(chan *client)
-	unregisterClientChan := make(chan uint64)
+	registerChan := make(chan *client)
+	unregisterChan := make(chan uint64)
 
-	go broadcast(registerClientChan, unregisterClientChan, broadcastChan)
+	go broadcast(registerChan, unregisterChan, broadcastChan)
 
 	for {
 		conn, err := listener.Accept()
@@ -107,19 +127,19 @@ func main() {
 		clientCtx, cancel := context.WithCancel(context.Background())
 
 		newClient := client{
-			clientID:           nextConnectionId.Add(1),
-			clientInputChannel: make(chan []byte, 100),
-			tcpConnection:      conn,
-			ctx:                clientCtx,
-			cancel:             cancel,
+			id:        nextConnectionId.Add(1),
+			inputChan: make(chan []byte, 100),
+			conn:      conn,
+			ctx:       clientCtx,
+			cancel:    cancel,
 		}
 
-		registerClientChan <- &newClient
-		go newClient.start(broadcastChan, unregisterClientChan)
+		registerChan <- &newClient
+		go newClient.start(broadcastChan, unregisterChan)
 	}
 }
 
-func broadcast(registerClientChan <-chan *client, unregisterClientChan <-chan uint64, broadcastChan <-chan message) {
+func broadcast(registerChan <-chan *client, unregisterChan <-chan uint64, broadcastChan <-chan message) {
 	connections := make(map[uint64]*client)
 	log.Println("INFO: broadcast function ready and waiting")
 
@@ -127,16 +147,18 @@ func broadcast(registerClientChan <-chan *client, unregisterClientChan <-chan ui
 		select {
 		case msg := <-broadcastChan:
 			for _, client := range connections {
-				select {
-				case client.clientInputChannel <- msg.data:
+				if msg.sender != client.id {
+					select {
+					case client.inputChan <- msg.data:
+					}
 				}
 			}
 
-		case newClient := <-registerClientChan:
-			connections[newClient.clientID] = newClient
-			log.Printf("INFO: Client %d registered.\n", newClient.clientID)
+		case newClient := <-registerChan:
+			connections[newClient.id] = newClient
+			log.Printf("INFO: Client %d registered.\n", newClient.id)
 
-		case clientID := <-unregisterClientChan:
+		case clientID := <-unregisterChan:
 			if clientPtr, ok := connections[clientID]; ok {
 				clientPtr.cancel()
 				delete(connections, clientID)
